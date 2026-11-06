@@ -1,0 +1,28 @@
+FLOWZY — COMPONENTES DE TERCEIROS
+=================================
+
+O Flowzy inclui os programas abaixo. Cada um continua sob a própria licença.
+
+1) Sunshine (motor de transmissão do "Jogar junto") — versão v2026.914.233613, MODIFICADA pelo Flowzy
+   Licença: GNU General Public License v3.0 (texto em GPL-3.0.txt, nesta pasta)
+   Original: https://github.com/LizardByte/Sunshine
+   Modificação do Flowzy: o motor transmite todo o som do computador, menos o do próprio Flowzy
+   (variável FLOW_AUDIO_EXCLUDE_PID). A modificação completa está em "sunshine-flowzy.patch", nesta pasta;
+   aplicada sobre o código-fonte original da versão acima, gera o sunshine.exe que acompanha o Flowzy.
+
+2) Moonlight (receptor do "Jogar junto") — Moonlight PC (Qt) 6.2.0, versão portátil, SEM modificações
+   Licença: GNU General Public License v3.0 (texto em GPL-3.0.txt)
+   Código-fonte: https://github.com/moonlight-stream/moonlight-qt (tag v6.2.0)
+   Inclui bibliotecas de terceiros (Qt, FFmpeg, SDL, OpenSSL, Opus, dav1d, libplacebo) sob as licenças
+   descritas no projeto Moonlight.
+
+3) ViGEmBus 1.22.0 (driver de controle virtual) — Nefarius Software Solutions e.U.
+   Licença: BSD 3-Clause. https://github.com/nefarius/ViGEmBus
+   ViGEmClient (biblioteca): licença MIT. https://github.com/nefarius/ViGEmClient
+
+4) Electron — licença MIT (texto em LICENSE.electron.txt, na pasta do programa)
+   Chromium e outros componentes: LICENSES.chromium.html, na pasta do programa.
+
+5) Bibliotecas JavaScript: React (MIT), Socket.IO client (MIT), koffi (MIT),
+   @sapphi-red/web-noise-suppressor (MIT; inclui RNNoise — https://github.com/xiph/rnnoise, BSD 3-Clause —
+   e GTCRN — https://github.com/Xiaobin-Rong/gtcrn, sob a licença desse projeto).
