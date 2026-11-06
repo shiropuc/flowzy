@@ -1,0 +1,230 @@
+diff --git a/cmake/packaging/windows.cmake b/cmake/packaging/windows.cmake
+index 27a33d4..ceb9d6f 100644
+--- a/cmake/packaging/windows.cmake
++++ b/cmake/packaging/windows.cmake
+@@ -99,5 +99,8 @@ set(CPACK_COMPONENT_FIREWALL_DESCRIPTION "Scripts to enable or disable firewall
+ set(CPACK_COMPONENT_FIREWALL_GROUP "Scripts")
+ 
+ # include specific packaging
+-include(${CMAKE_MODULE_PATH}/packaging/windows_nsis.cmake)
+-include(${CMAKE_MODULE_PATH}/packaging/windows_wix.cmake)
++# Flow: instaladores não são usados (só o sunshine.exe)
++if(NOT FLOW_NO_INSTALLERS)
++    include(${CMAKE_MODULE_PATH}/packaging/windows_nsis.cmake)
++    include(${CMAKE_MODULE_PATH}/packaging/windows_wix.cmake)
++endif()
+diff --git a/src/platform/windows/audio.cpp b/src/platform/windows/audio.cpp
+index 9ace2a6..e6a19f2 100644
+--- a/src/platform/windows/audio.cpp
++++ b/src/platform/windows/audio.cpp
+@@ -11,6 +11,7 @@
+ // platform includes
+ #include <Audioclient.h>
+ #include <avrt.h>
++#include <cstdlib>
+ #include <mmdeviceapi.h>
+ #include <newdev.h>
+ #include <roapi.h>
+@@ -344,6 +345,175 @@ namespace platf::audio {
+     },
+   };
+ 
++  /**
++   * @brief Create audio client.
++   *
++   * @param device D3D, audio, or platform device used by the operation.
++   * @param format Pixel, audio, or protocol format being converted.
++   * @return Constructed audio client object.
++   */
++  /**
++   * @brief Process id whose audio (and its children's) must stay out of the stream (Flow).
++   *
++   * Read from the FLOW_AUDIO_EXCLUDE_PID environment variable; 0 means "capture everything".
++   *
++   * @return Process id to exclude, or 0.
++   */
++  // audioclientactivationparams.h is missing from MinGW: same layout as the Windows SDK.
++  constexpr int FLOW_ACTIVATION_TYPE_PROCESS_LOOPBACK = 1;  ///< AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK
++  constexpr int FLOW_LOOPBACK_MODE_EXCLUDE_TREE = 1;  ///< PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE
++  constexpr auto FLOW_VAD_PROCESS_LOOPBACK = L"VAD\\Process_Loopback";  ///< VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK
++
++  /**
++   * @brief Mirror of AUDIOCLIENT_ACTIVATION_PARAMS (process loopback variant).
++   */
++  struct flow_activation_params_t {
++    int ActivationType;  ///< Activation type.
++    DWORD TargetProcessId;  ///< Process tree root.
++    int ProcessLoopbackMode;  ///< Include or exclude the tree.
++  };
++
++  DWORD flow_exclude_pid() {
++    char buf[32] {};
++    auto len = GetEnvironmentVariableA("FLOW_AUDIO_EXCLUDE_PID", buf, sizeof(buf));
++    if (len == 0 || len >= sizeof(buf)) {
++      return 0;
++    }
++    return (DWORD) std::strtoul(buf, nullptr, 10);
++  }
++
++  /**
++   * @brief Completion handler for ActivateAudioInterfaceAsync (Flow process loopback).
++   */
++  class flow_activate_handler_t: public IActivateAudioInterfaceCompletionHandler, public IAgileObject {
++  public:
++    HANDLE done = CreateEventA(nullptr, TRUE, FALSE, nullptr);  ///< Signaled when activation completes.
++    HRESULT result = E_FAIL;  ///< Activation result.
++    audio_client_t client;  ///< Activated audio client.
++
++    ~flow_activate_handler_t() {
++      CloseHandle(done);
++    }
++
++    /**
++     * @brief Static reference count (lifetime owned by the caller).
++     * @return 1.
++     */
++    ULONG STDMETHODCALLTYPE AddRef() override {
++      return 1;
++    }
++
++    /**
++     * @brief Static reference count (lifetime owned by the caller).
++     * @return 1.
++     */
++    ULONG STDMETHODCALLTYPE Release() override {
++      return 1;
++    }
++
++    /**
++     * @brief Return the supported COM interfaces.
++     * @param riid Requested interface.
++     * @param ppv Output pointer.
++     * @return S_OK or E_NOINTERFACE.
++     */
++    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override {
++      if (riid == IID_IUnknown || riid == __uuidof(IActivateAudioInterfaceCompletionHandler)) {
++        *ppv = static_cast<IActivateAudioInterfaceCompletionHandler *>(this);
++        return S_OK;
++      }
++      if (riid == __uuidof(IAgileObject)) {
++        *ppv = static_cast<IAgileObject *>(this);
++        return S_OK;
++      }
++      *ppv = nullptr;
++      return E_NOINTERFACE;
++    }
++
++    /**
++     * @brief Called by Windows when the activation finishes.
++     * @param op Async operation.
++     * @return S_OK.
++     */
++    HRESULT STDMETHODCALLTYPE ActivateCompleted(IActivateAudioInterfaceAsyncOperation *op) override {
++      IUnknown *unk = nullptr;
++      HRESULT hr = E_FAIL;
++      result = op->GetActivateResult(&hr, &unk);
++      if (SUCCEEDED(result)) {
++        result = hr;
++      }
++      if (SUCCEEDED(result) && unk) {
++        result = unk->QueryInterface(IID_IAudioClient, (void **) &client);
++      }
++      if (unk) {
++        unk->Release();
++      }
++      SetEvent(done);
++      return S_OK;
++    }
++  };
++
++  /**
++   * @brief Create a loopback client that captures every process except the Flow process tree.
++   *
++   * @param format Audio format to capture.
++   * @param pid Process id to exclude (with its children).
++   * @return Initialized audio client, or nullptr on failure.
++   */
++  audio_client_t make_flow_exclude_client(const format_t &format, DWORD pid) {
++    using activate_fn = HRESULT(WINAPI *)(LPCWSTR, REFIID, PROPVARIANT *, IActivateAudioInterfaceCompletionHandler *, IActivateAudioInterfaceAsyncOperation **);
++    auto mod = LoadLibraryW(L"mmdevapi.dll");
++    auto activate = mod ? (activate_fn) GetProcAddress(mod, "ActivateAudioInterfaceAsync") : nullptr;
++    if (!activate) {
++      BOOST_LOG(warning) << "Flow: ActivateAudioInterfaceAsync not available"sv;
++      return nullptr;
++    }
++
++    flow_activation_params_t params {FLOW_ACTIVATION_TYPE_PROCESS_LOOPBACK, pid, FLOW_LOOPBACK_MODE_EXCLUDE_TREE};
++
++    PROPVARIANT prop {};
++    prop.vt = VT_BLOB;
++    prop.blob.cbSize = sizeof(params);
++    prop.blob.pBlobData = (BYTE *) &params;
++
++    flow_activate_handler_t handler;
++    IActivateAudioInterfaceAsyncOperation *op = nullptr;
++    auto status = activate(FLOW_VAD_PROCESS_LOOPBACK,IID_IAudioClient, &prop, &handler, &op);
++    if (FAILED(status)) {
++      BOOST_LOG(warning) << "Flow: process loopback activation failed [0x"sv << util::hex(status).to_string_view() << ']';
++      return nullptr;
++    }
++    WaitForSingleObject(handler.done, 5000);
++    if (op) {
++      op->Release();
++    }
++    if (FAILED(handler.result) || !handler.client) {
++      BOOST_LOG(warning) << "Flow: process loopback activation result [0x"sv << util::hex(handler.result).to_string_view() << ']';
++      return nullptr;
++    }
++
++    WAVEFORMATEXTENSIBLE capture_waveformat =
++      create_waveformat(sample_format_e::f32, format.channel_count, format.capture_waveformat_channel_mask);
++
++    status = handler.client->Initialize(
++      AUDCLNT_SHAREMODE_SHARED,
++      AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK |
++        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
++      200000,  // 20 ms (process loopback needs an explicit buffer)
++      0,
++      (LPWAVEFORMATEX) &capture_waveformat,
++      nullptr
++    );
++    if (FAILED(status)) {
++      BOOST_LOG(warning) << "Flow: couldn't initialize process loopback for ["sv << format.name << "]: [0x"sv << util::hex(status).to_string_view() << ']';
++      return nullptr;
++    }
++
++    BOOST_LOG(info) << "Flow: capturing all audio except process tree "sv << pid << ", format "sv
++                    << logging::bracket(waveformat_to_pretty_string(capture_waveformat));
++    return std::move(handler.client);
++  }
++
+   /**
+    * @brief Create audio client.
+    *
+@@ -352,6 +522,13 @@ namespace platf::audio {
+    * @return Constructed audio client object.
+    */
+   audio_client_t make_audio_client(device_t &device, const format_t &format) {
++    if (auto pid = flow_exclude_pid()) {
++      if (auto client = make_flow_exclude_client(format, pid)) {
++        return client;
++      }
++      BOOST_LOG(warning) << "Flow: falling back to full device capture"sv;
++    }
++
+     audio_client_t audio_client;
+     auto status = device->Activate(
+       IID_IAudioClient,
+@@ -662,8 +839,10 @@ namespace platf::audio {
+         return -1;
+       }
+ 
+-      REFERENCE_TIME default_latency;
+-      audio_client->GetDevicePeriod(&default_latency, nullptr);
++      REFERENCE_TIME default_latency = 100000;  // 10 ms if the client doesn't report one (process loopback)
++      if (FAILED(audio_client->GetDevicePeriod(&default_latency, nullptr))) {
++        default_latency = 100000;
++      }
+       default_latency_ms = default_latency / 1000;
+       continuous_audio = continuous;
+ 
